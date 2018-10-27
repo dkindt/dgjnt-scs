@@ -1,47 +1,63 @@
 from enum import Enum
-import json
 from socket import (
     AF_INET,
     socket,
     SOCK_STREAM,
+    SOL_SOCKET,
+    SO_REUSEADDR,
 )
 from threading import Thread
 
+# Default CONSTANTS
+_HOST = "127.0.0.1"
+_PORT = 9020
+_MAX_MESSAGE_SIZE = 1024
+_MAX_ACTIVE_CONNECTIONS = 100
+
 
 class Status(Enum):
-    FAILED = "FAILED"
-    READY = "READY"
-    RUNNING = "RUNNING"
-    STOPPED = "STOPPED"
-
-
-class ClientConnection(Thread):
-
-    def __init__(self, host, port, target, *args):
-        super().__init__(target=target, args=args)
-        self._host = host
-        self._port = port
+    FAILED = -1
+    READY = 0
+    RUNNING = 1
+    STOPPED = 2
 
 
 class Server(object):
 
-    HOST = "127.0.0.1"
-    PORT = 9020
-    BUFFER_SIZE = 1024
-    MAX_CONNECTIONS = 100
+    AVAILABLE_COMMANDS = [
+        "help",
+        "name",
+        "get",
+        "push",
+        "adios",
+    ]
 
-    def __init__(self, *args, **kwargs):
-        self._host = ""
-        self._port = 8888
+    def __init__(self, host, port, **kwargs):
+        """
+        The host and port number are required to have initialize
+        this Server.
+        """
+        self._host = host
+        self._port = port
+        self._max_active_connections = kwargs.get(
+            "MAX_ACTIVE_CONNECTIONS", _MAX_ACTIVE_CONNECTIONS)
+        self._max_message_size = kwargs.get(
+            "MAX_MESSAGE_SIZE", _MAX_MESSAGE_SIZE)
         self._status = Status.READY
-
         self.__socket = socket(AF_INET, SOCK_STREAM)
-        self.__clients = {}
-        self.__addresses = {}
+        self.__clients = []
 
     @property
     def host(self):
         return self._host
+
+    @property
+    def max_active_connections(self):
+        return self._max_active_connections
+    
+    @property
+    def max_message_size(self):
+        return self._max_message_size
 
     @property
     def port(self):
@@ -51,76 +67,130 @@ class Server(object):
     def status(self):
         return self._status
 
+    def prompt(self, name):
+        """ Helper to prompt a Client with available commands. """
+        msg = """
+        Here are the available commands:
+        {0} -- Displays this prompt again.
+        {1} -- Update your username.
+        {2} -- View chat history.
+        {3} -- Send chat message.
+        {4} -- Leave the chat room.        
+        """.format(name, *self.AVAILABLE_COMMANDS)
+        return msg
+
     def start(self, backlog=None):
         # (1) Enable the server to accept connections/clients.
-        self.__socket.bind(address=(self.HOST, self.PORT))
-        self.__socket.listen(backlog=(backlog or self.MAX_CONNECTIONS))
-        print("[Server] Listening on {0}:[1}".format(self.HOST, self.PORT))
-
-        # (2) Cleanup any previous connections. Right now,
-        # this is just a sanity check.
+        # socket.setsockopt is to avoid socket timeouts.
+        self.__socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+        self.__socket.bind(address=(self.host, self.port))
+        self.__socket.listen(backlog=(backlog or self.max_active_connections))
+        # (2) Cleanup any previous connections.
         if not self._status.READY:
-            self.__addresses.clear()
             self.__clients.clear()
-
         # (3) This is where we actually "start" the server
         # and begin accepting inbound connections/clients.
-        while True:
-            try:
-                # Client socket and the address (host, port).
-                client, address = self.__socket.accept()
-                self.__addresses[client] = address
-                # Respond to the client and let them know they were successfully.
-                client.send(message("[Server] You are now connected!"))
-                client.send(message("[Server] Please type your name!"))
-                # Start a new ClientConnection Thread
-                args = (client, )
-                ClientConnection(
-                    address[0],
-                    address[1],
-                    self.handle_client,
-                    *args,
-                ).start()
+        listener = Thread(target=self.listen)
+        listener.start()
+        listener.join()
+        self.__socket.close()
 
-            except Exception:
-                # Client data (client, address) was not
-                # correct.
-                print("[Server] Failed client connection")
+    def listen(self):
+        """ Listen for inbound connections from clients """
+        self._status = Status.RUNNING
+        while self.status.RUNNING:
+            client = _Client(*self.__socket.accept())
+            self.__clients.append(client)
+            client.communicate("Welcome to Group 10's Server!")
+            client.communicate("Please enter a username: ")
+            # Create a thread to handle the client's requests.
+            client_thread = Thread(target=self.handle_client, args=(client, ))
+            client_thread.start()
 
     def handle_client(self, client):
-        """ Handles a single Client connection. """
-        username = client.recv(self.BUFFER_SIZE).decode("UTF8")
-        # TODO: Let Client know available commands.
-        client.send(message("[Server] Welcome type {quit} to exit."))
-        self._broadcast(username, "{} has joined the chat!".format(username))
-        self.__clients[client] = username
-        while True:
-            try:
-                msg = client.recv(self.BUFFER_SIZE)
-                if msg != message("{quit}"):
-                    self._broadcast("{}: ".format(username), msg)
-                else:
-                    client.send(message("{quit}"))
-                    client.close()
-                    self.__clients.pop(client)
-                    self._broadcast("{}: ".format(username), "has left the chat!")
-                    break
-            except:
-                client.close()
+        """ Process any Client requests from the client """
+        # Get the Client's name, prompt them with the available
+        # commands, and then introduce them to the entire chat
+        # room.
+        client.username = client.get_input()
+        client.communicate(self.prompt(client.username))
+        self.broadcast("{} has joined the chat!".format(client.username))
 
-    def _broadcast(self, prefix="", msg=""):
-        """
-        Broadcasts the message to the entire chat room.
+        # As long as the Client is active (hasn't typed 'adios'), then
+        # process their requests.
+        is_active = True
+        while is_active:
+            data = client.get_input()
+            if data != "adios":
+                self.broadcast("{}: {}".format(client.username, data))
+            else:
+                client.communicate("Adios!")
+                self.__clients.remove(client)
+                client.disconnect()
+                self.broadcast("{} left the chat".format(client.username))
+                is_active = False
 
-        :param prefix: Username (i.e. "dkindt: ")
-        :param message: Message to be broadcast.
-        """
-        full_message = message("{}{}".format(prefix, msg))
+    def broadcast(self, msg):
+        """ Broadcasts the given message to all active Clients """
+        if not isinstance(msg, bytes):
+            msg = message(msg)
+
         for client in self.__clients:
-            client.send(full_message)
+            client.communicate(msg)
 
 
-def message(message):
-    """ Encodes message to send to a client"""
-    return bytes(message, "UTF8")
+class _Client(object):
+    """ Helper class to keep track of a connected clients """
+    def __init__(self, socket_, host, port):
+        self._socket = socket_
+        self._host = host
+        self._port = port
+        self._message_size = _MAX_MESSAGE_SIZE
+        self._username = None
 
+    @property
+    def username(self):
+        return self._username
+
+    @username.setter
+    def username(self, value):
+        self._username = value
+
+    def communicate(self, data):
+        """ Send a message to the client """
+        if not isinstance(data, bytes):
+            # Convert the string of data to bytes
+            data = message(data)
+        self._socket.send(data)
+
+    def disconnect(self):
+        """ Closes the connection to Client """
+        self._socket.close()
+
+    def fileno(self):
+        """
+        Pass along the server's fileno() reference.
+        This lets allows the Client to pretend it's
+        a socket.
+        """
+        return self._socket.fileno()
+
+    def get_input(self):
+        """ Get input from the Client and clean the data """
+        data = self._socket.recv(self._message_size)
+        return data.decode("UTF8").strip()
+
+
+def message(msg, prefix=""):
+    """
+    Helper to encode a string to bytes so that the server is able to
+    communicate with the clients.
+
+    :param msg: The message to encode (if not already done)
+    :param prefix: The username or prefix to prepend to msg
+    :return encoded utf8 bytes message ready to send.
+    """
+    if prefix and not prefix.strip().endswith(":"):
+        prefix = "{}: ".format(prefix)
+    full_message = "".format(prefix, msg)
+    return bytes(full_message, "UTF8")
